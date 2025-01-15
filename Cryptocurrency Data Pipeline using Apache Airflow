@@ -1,0 +1,135 @@
+# dags/crypto_pipeline.py
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.http.sensors.http import HttpSensor
+import requests
+import pandas as pd
+import json
+
+# Default arguments for the DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 1, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5)
+}
+
+def fetch_crypto_prices():
+    """Fetch cryptocurrency prices from CoinGecko API"""
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        'ids': 'bitcoin,ethereum,cardano',
+        'vs_currencies': 'usd',
+        'include_24hr_vol': True,
+        'include_24hr_change': True
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    
+    # Save raw data
+    with open('/tmp/raw_crypto_data.json', 'w') as f:
+        json.dump(data, f)
+
+def process_crypto_data():
+    """Transform raw crypto data into structured format"""
+    with open('/tmp/raw_crypto_data.json', 'r') as f:
+        data = json.load(f)
+    
+    processed_data = []
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    for crypto, metrics in data.items():
+        processed_data.append({
+            'timestamp': timestamp,
+            'cryptocurrency': crypto,
+            'price_usd': metrics['usd'],
+            'volume_24h': metrics.get('usd_24h_vol', 0),
+            'price_change_24h': metrics.get('usd_24h_change', 0)
+        })
+    
+    df = pd.DataFrame(processed_data)
+    df.to_csv('/tmp/processed_crypto_data.csv', index=False)
+
+def calculate_metrics():
+    """Calculate additional metrics and generate insights"""
+    df = pd.read_csv('/tmp/processed_crypto_data.csv')
+    
+    metrics = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'total_volume': df['volume_24h'].sum(),
+        'avg_price_change': df['price_change_24h'].mean(),
+        'highest_price_crypto': df.loc[df['price_usd'].idxmax(), 'cryptocurrency'],
+        'highest_volume_crypto': df.loc[df['volume_24h'].idxmax(), 'cryptocurrency']
+    }
+    
+    with open('/tmp/crypto_metrics.json', 'w') as f:
+        json.dump(metrics, f)
+
+# Create the DAG
+dag = DAG(
+    'crypto_etl_pipeline',
+    default_args=default_args,
+    description='A DAG for collecting and processing cryptocurrency data',
+    schedule_interval=timedelta(hours=1),
+    catchup=False
+)
+
+# Create tasks
+check_api = HttpSensor(
+    task_id='check_api',
+    http_conn_id='coingecko_api',
+    endpoint='api/v3/simple/price',
+    request_params={'ids': 'bitcoin', 'vs_currencies': 'usd'},
+    dag=dag
+)
+
+create_table = PostgresOperator(
+    task_id='create_table',
+    postgres_conn_id='postgres_default',
+    sql="""
+        CREATE TABLE IF NOT EXISTS crypto_prices (
+            timestamp TIMESTAMP,
+            cryptocurrency VARCHAR(50),
+            price_usd DECIMAL,
+            volume_24h DECIMAL,
+            price_change_24h DECIMAL
+        );
+    """,
+    dag=dag
+)
+
+fetch_prices = PythonOperator(
+    task_id='fetch_prices',
+    python_callable=fetch_crypto_prices,
+    dag=dag
+)
+
+process_data = PythonOperator(
+    task_id='process_data',
+    python_callable=process_crypto_data,
+    dag=dag
+)
+
+calculate_insights = PythonOperator(
+    task_id='calculate_insights',
+    python_callable=calculate_metrics,
+    dag=dag
+)
+
+load_data = PostgresOperator(
+    task_id='load_data',
+    postgres_conn_id='postgres_default',
+    sql="""
+        COPY crypto_prices FROM '/tmp/processed_crypto_data.csv'
+        DELIMITER ',' CSV HEADER;
+    """,
+    dag=dag
+)
+
+# Define task dependencies
+check_api >> create_table >> fetch_prices >> process_data >> calculate_insights >> load_data
